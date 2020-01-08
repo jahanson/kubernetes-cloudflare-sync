@@ -34,3 +34,5 @@ require (
 	k8s.io/client-go v9.0.0+incompatible
 	sigs.k8s.io/yaml v1.1.0 // indirect
 )
+
+go 1.13

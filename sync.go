@@ -2,108 +2,71 @@ package main
 
 import (
 	"log"
+	"sort"
 	"strings"
+	"strconv"
 
 	cloudflare "github.com/cloudflare/cloudflare-go"
 	"github.com/pkg/errors"
 )
 
 func sync(ips []string, dnsNames []string, cloudflareTTL int, cloudflareProxy bool) error {
+	//Should make lbAddressLimit a Configuration property in the secret
+	//Fact is I didn't want to pay extra for 3 addresses on cloudflare when only 2 are included.
+	lbAddressLimit := 2
+	sort.Strings(ips)
+	nodeIPs := append(ips[0:lbAddressLimit])
+
 	api, err := cloudflare.New(options.CloudflareAPIKey, options.CloudflareAPIEmail)
 	if err != nil {
 		return errors.Wrap(err, "failed to access cloudflare api")
 	}
 
-	root := dnsNames[0]
-	zoneID, err := findZoneID(api, root)
+
+	pools, err := api.ListLoadBalancerPools()
 	if err != nil {
-		return errors.Wrapf(err, "failed to find zone id for dns-name:=%s",
-			root)
+		return errors.Wrap(err, "failed to list the load balancer pools")
 	}
+	//Should probably add a conditional on the name of the pool so 
+	//we're not updating every single pool to our kubernetes node ips 😬
+	//I currently only have 1 so this is fine.
+	for _, pool := range pools {
+		lbIps := []string{}
+		for _, origin := range pool.Origins{
+			lbIps = append(lbIps, origin.Address)
+		}
+		sort.Strings(lbIps)
 
-	known := map[string]bool{}
-	for _, ip := range ips {
-		known[ip] = true
-	}
+		nodeIPsJoin := strings.Join(nodeIPs, ",")
+		lbIPsJoin := strings.Join(lbIps, ",")
+		
+		if nodeIPsJoin == lbIPsJoin {
+			log.Printf("no change detected")
+			return nil
+		}
 
-	for _, dnsName := range dnsNames {
-		records, err := api.DNSRecords(zoneID, cloudflare.DNSRecord{Type: "A", Name: dnsName})
+		log.Printf("node-ips: %s", nodeIPsJoin)
+		log.Printf("loadbalancer-ips: %s", lbIPsJoin)
+
+		newOrigins := []cloudflare.LoadBalancerOrigin{}
+		for index, ip := range nodeIPs {
+			origin := cloudflare.LoadBalancerOrigin{
+				Name: "kube-"+strconv.Itoa(index),
+				Address: string(ip),
+				Enabled: true,
+				Weight: 1,
+			}
+			newOrigins = append(newOrigins, origin)
+		}
+
+		log.Printf("Updating Loadbalancer pool %s",pool.Name)
+		log.Println(newOrigins)
+		pool.Origins = newOrigins
+		_, err := api.ModifyLoadBalancerPool(pool)
 		if err != nil {
-			return errors.Wrapf(err, "failed to list dns records for zone-id=%s name=%s",
-				zoneID, dnsName)
-		}
-
-		seen := map[string]bool{}
-
-		for _, record := range records {
-			log.Printf("found existing record name=%s ip=%s\n",
-				record.Name, record.Content)
-			if _, ok := known[record.Content]; ok {
-				seen[record.Content] = true
-
-				if record.Proxied != cloudflareProxy || record.TTL != cloudflareTTL {
-					log.Printf("updating dns record name=%s ip=%s\n",
-						record.Name, record.Content)
-					err := api.UpdateDNSRecord(zoneID, record.ID, cloudflare.DNSRecord{
-						Type:    record.Type,
-						Name:    record.Name,
-						Content: record.Content,
-						TTL:     cloudflareTTL,
-						Proxied: cloudflareProxy,
-					})
-					if err != nil {
-						return errors.Wrapf(err, "failed to update dns record zone-id=%s record-id=%s name=%s ip=%s",
-							zoneID, record.ID, record.Name, record.Content)
-					}
-				}
-			} else {
-				log.Printf("removing dns record name=%s ip=%s\n",
-					record.Name, record.Content)
-				err := api.DeleteDNSRecord(zoneID, record.ID)
-				if err != nil {
-					return errors.Wrapf(err, "failed to delete dns record zone-id=%s record-id=%s name=%s ip=%s",
-						zoneID, record.ID, record.Name, record.Content)
-				}
-			}
-		}
-
-		for ip := range known {
-			if _, ok := seen[ip]; ok {
-				continue
-			}
-			log.Printf("adding dns record name=%s ip=%s\n",
-				dnsName, ip)
-			_, err := api.CreateDNSRecord(zoneID, cloudflare.DNSRecord{
-				Type:    "A",
-				Name:    dnsName,
-				Content: ip,
-				TTL:     cloudflareTTL,
-				Proxied: cloudflareProxy,
-			})
-			if err != nil {
-				return errors.Wrapf(err, "failed to create dns record zone-id=%s name=%s ip=%s",
-					zoneID, dnsName, ip)
-			}
+			errors.Wrapf(err, "Error updating the Load Balaner Pool %s", pool.Name)
 		}
 	}
 
 	return nil
-}
-
-// findZoneID finds a zone id for the given dns record
-func findZoneID(api interface {
-	ListZones(z ...string) ([]cloudflare.Zone, error)
-}, dnsName string) (string, error) {
-	zones, err := api.ListZones()
-	if err != nil {
-		return "", err
-	}
-
-	for _, zone := range zones {
-		if zone.Name == dnsName || strings.HasSuffix(dnsName, "."+zone.Name) {
-			return zone.ID, nil
-		}
-	}
-
-	return "", errors.New("zone id not found")
 }
